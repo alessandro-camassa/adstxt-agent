@@ -468,6 +468,8 @@ BOT_CHECK_MARKERS = ("just a moment", "cf-browser-verification", "challenge-plat
 MULTI_PART_SUFFIXES = {
     "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "co.nz", "co.jp",
     "co.za", "com.br", "com.mx", "com.ar", "com.tr", "co.in", "co.kr", "com.sg", "com.hk",
+    "com.cn", "net.cn", "org.cn", "com.tw", "co.il", "co.id", "com.my", "com.ph", "com.vn",
+    "co.th", "com.pl", "com.co", "com.pe", "com.uy", "com.ua", "co.ke", "com.ng", "com.eg",
     "pages.dev", "github.io", "blogspot.com", "netlify.app", "vercel.app", "web.app",
     "firebaseapp.com", "herokuapp.com", "wordpress.com",
 }
@@ -592,18 +594,21 @@ def _check_host(host: str) -> dict:
 def _check_one(domain: str) -> dict:
     """Check a site, falling back to its main domain if a subdomain has no ads.txt."""
     if domain.endswith(MIRROR_SUFFIX):
-        return {"checked_domain": domain, "used_main_domain": 0, "status": "mirror",
-                "http_code": None, "final_url": None, "evidence": None, "relationship": None,
-                "detail": f"translate.goog mirror of {_mirror_origin(domain)}"}
-    result = _check_host(domain)
-    result["used_main_domain"] = 0
-    main = _main_domain(domain)
-    if result["status"] == "no_ads_txt" and main != domain:
-        fallback = _check_host(main)
-        fallback["used_main_domain"] = 1
-        fallback["detail"] = f"no ads.txt on {domain}; checked {main}" + (
-            f" ({fallback['detail']})" if fallback["detail"] else "")
-        result = fallback
+        result = {"checked_domain": domain, "used_main_domain": 0, "status": "mirror",
+                  "http_code": None, "final_url": None, "evidence": None, "relationship": None,
+                  "detail": f"translate.goog mirror of {_mirror_origin(domain)}"}
+    else:
+        result = _check_host(domain)
+        result["used_main_domain"] = 0
+        main = _main_domain(domain)
+        if result["status"] == "no_ads_txt" and main != domain:
+            fallback = _check_host(main)
+            fallback["used_main_domain"] = 1
+            fallback["detail"] = f"no ads.txt on {domain}; checked {main}" + (
+                f" ({fallback['detail']})" if fallback["detail"] else "")
+            result = fallback
+    # When this site's check finished, not when the batch was saved.
+    result["checked_at"] = datetime.now(timezone.utc).isoformat()
     return result
 
 
@@ -623,7 +628,8 @@ def _save_results(checked: list[tuple[str, float | None, dict]]) -> None:
                 " detail = excluded.detail, bid_requests = excluded.bid_requests,"
                 " checked_at = excluded.checked_at",
                 (domain, r["checked_domain"], r["used_main_domain"], r["status"], r["http_code"],
-                 r["final_url"], r["evidence"], r["relationship"], r["detail"], bids, now),
+                 r["final_url"], r["evidence"], r["relationship"], r["detail"], bids,
+                 r.get("checked_at") or now),
             )
             if r["status"] == "blocked":
                 conn.execute(
@@ -690,6 +696,11 @@ STATUSES = ("authorised", "ob_only", "other_onetag_id", "no_onetag_line",
             "no_ads_txt", "blocked", "mirror", "error")
 
 
+def brief_path() -> Path:
+    """Where today's brief is saved."""
+    return RESULTS_DIR / f"brief-{datetime.now():%Y-%m-%d}.md"
+
+
 def _connect_readonly() -> sqlite3.Connection:
     """Read-only connection: any write through it fails at the SQLite level."""
     conn = sqlite3.connect(DB_PATH.as_uri() + "?mode=ro", uri=True)
@@ -729,8 +740,11 @@ def query_results(status: str = "all", limit: int = 20) -> str:
 def summarise() -> str:
     """Counts by status and the bid requests in each, straight from the database.
 
-    Also reports how many imported domains have been checked so far and how
-    many sites are waiting in manual_check. Read-only.
+    Also reports how many imported domains have been checked so far, how many
+    sites are waiting in manual_check, how many authorised sites pass through
+    Freestar's central file on a.pub.network, the DIRECT/RESELLER split
+    among authorised sites, and the ten most common other onetag.com account
+    IDs with their counts. Read-only.
     """
     conn = _connect_readonly()
     try:
@@ -741,6 +755,21 @@ def summarise() -> str:
             "SELECT COUNT(*) AS n, COALESCE(SUM(bid_requests), 0) AS b FROM domains").fetchone()
         manual = conn.execute(
             "SELECT COUNT(*) AS n, COALESCE(SUM(bid_requests), 0) AS b FROM manual_check").fetchone()
+        freestar = conn.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(bid_requests), 0) AS b FROM results"
+            " WHERE status = 'authorised' AND final_url LIKE 'https://a.pub.network%'").fetchone()
+        relationships = [dict(r) for r in conn.execute(
+            "SELECT COALESCE(relationship, 'none') AS relationship, COUNT(*) AS domains,"
+            " COALESCE(SUM(bid_requests), 0) AS bid_requests FROM results"
+            " WHERE status = 'authorised' GROUP BY 1 ORDER BY bid_requests DESC")]
+        other_ids = Counter()
+        other_bids = Counter()
+        for r in conn.execute("SELECT evidence, bid_requests FROM results"
+                              " WHERE status = 'other_onetag_id' AND evidence IS NOT NULL"):
+            fields = [f.strip() for f in r["evidence"].split(",")]
+            account = fields[1].lower() if len(fields) > 1 else "?"
+            other_ids[account] += 1
+            other_bids[account] += r["bid_requests"] or 0
     finally:
         conn.close()
     checked = sum(s["domains"] for s in by_status)
@@ -753,6 +782,11 @@ def summarise() -> str:
         "imported_bid_requests": imported["b"],
         "unchecked_domains": imported["n"] - checked,
         "manual_check": {"domains": manual["n"], "bid_requests": manual["b"]},
+        "authorised_via_freestar_file": {"domains": freestar["n"], "bid_requests": freestar["b"],
+                                         "host": "a.pub.network"},
+        "authorised_by_relationship": relationships,
+        "other_onetag_ids": [{"account_id": a, "domains": n, "bid_requests": other_bids[a]}
+                             for a, n in other_ids.most_common(10)],
     })
 
 
@@ -760,6 +794,6 @@ def summarise() -> str:
 def write_brief(markdown: str) -> str:
     """Save a markdown brief to results/brief-YYYY-MM-DD.md (today's date), replacing any earlier one from today."""
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = RESULTS_DIR / f"brief-{datetime.now():%Y-%m-%d}.md"
+    path = brief_path()
     path.write_text(markdown, encoding="utf-8")
     return json.dumps({"saved": str(path.relative_to(ROOT)), "characters": len(markdown)})
