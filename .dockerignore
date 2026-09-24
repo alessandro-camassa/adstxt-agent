@@ -1,0 +1,10 @@
+# Never send secrets, data or local environments into the image.
+.env
+.env.*
+data/
+results/
+.venv/
+.git/
+.claude/
+__pycache__/
+*.pyc

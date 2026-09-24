@@ -82,6 +82,17 @@ This runs all four steps and prints each tool call, the brief, the tokens used a
 .venv/bin/python check_agent.py "check the top 50 domains and tell me what you found"
 ```
 
+**In a container** (Docker or OrbStack). The image holds only the code. The key comes from `.env` when the container starts, and `data/` and `results/` are shared with your machine:
+
+```bash
+docker build -t adstxt-agent .
+docker run --rm --env-file .env \
+  -v "$PWD/data:/app/data" -v "$PWD/results:/app/results" \
+  adstxt-agent "data/uploads/<spreadsheet>.xlsx" --top 20
+```
+
+The spreadsheet must be inside `data/`, so the container can see it.
+
 ## Time and cost
 
 Measured on the full Freestar list: 1,711 rows, 1,650 domains.
